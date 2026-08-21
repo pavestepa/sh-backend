@@ -1,0 +1,426 @@
+// Prisma schema for the one-off local services marketplace backend.
+//
+// Money is stored as integer minor units (kopecks) — never as float.
+// Geo search uses PostGIS via a raw `geography(Point,4326)` column kept in
+// sync with the plain lat/lng columns; Prisma cannot write/query that column
+// directly, so it is written/read through raw SQL in OrdersGeoRepository.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+enum UserMode {
+  CUSTOMER
+  WORKER
+}
+
+model User {
+  id             String   @id @default(uuid())
+  phone          String   @unique
+  name           String
+  avatarObjectKey String?
+  activeMode     UserMode @default(CUSTOMER)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  customerProfile CustomerProfile?
+  workerProfile   WorkerProfile?
+
+  refreshSessions RefreshSession[]
+  pushDevices     PushDevice[]
+
+  ordersAsCustomer   Order[]            @relation("OrdersAsCustomer")
+  orderApplications  OrderApplication[]
+  uploadedPhotos     OrderPhoto[]
+  authoredReviews    Review[]           @relation("ReviewAuthor")
+  receivedReviews    Review[]           @relation("ReviewTarget")
+  orderEvents        OrderEvent[]
+  idempotencyRecords IdempotencyRecord[]
+
+  @@index([phone])
+  @@map("users")
+}
+
+model CustomerProfile {
+  userId               String   @id
+  rating                Decimal  @default(0) @db.Decimal(3, 2)
+  reviewsCount          Int      @default(0)
+  completedOrdersCount  Int      @default(0)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("customer_profiles")
+}
+
+model WorkerProfile {
+  userId               String   @id
+  description           String?
+  rating                 Decimal  @default(0) @db.Decimal(3, 2)
+  reviewsCount           Int      @default(0)
+  completedOrdersCount   Int      @default(0)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categories WorkerCategory[]
+
+  @@map("worker_profiles")
+}
+
+// ---------------------------------------------------------------------------
+// Categories
+// ---------------------------------------------------------------------------
+
+model Category {
+  id       String  @id @default(uuid())
+  name     String
+  parentId String?
+  isActive Boolean @default(true)
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+
+  workers WorkerCategory[]
+  orders  Order[]
+
+  @@index([parentId])
+  @@index([isActive])
+  @@map("categories")
+}
+
+model WorkerCategory {
+  workerId   String
+  categoryId String
+
+  worker   WorkerProfile @relation(fields: [workerId], references: [userId], onDelete: Cascade)
+  category Category      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([workerId, categoryId])
+  @@index([categoryId])
+  @@map("worker_categories")
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+enum OrderStatus {
+  OPEN
+  ACCEPTED
+  IN_PROGRESS
+  WAITING_CONFIRMATION
+  COMPLETED
+  CANCELLED
+}
+
+model Order {
+  id         String @id @default(uuid())
+  customerId String
+  categoryId String
+
+  title       String
+  description String?
+
+  initialPriceMinor Int
+  agreedPriceMinor  Int?
+  currency          String @default("RUB")
+
+  latitude  Float
+  longitude Float
+  // Kept in sync with latitude/longitude via raw SQL; indexed with GiST.
+  location  Unsupported("geography(Point,4326)")?
+  address   String?
+
+  requiredAt      DateTime
+  agreedWorkTime  DateTime?
+
+  status                 OrderStatus @default(OPEN)
+  selectedApplicationId  String?     @unique
+
+  cancelReason     String?
+  cancelledByUserId String?
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  acceptedAt       DateTime?
+  startedAt        DateTime?
+  workSubmittedAt  DateTime?
+  completedAt      DateTime?
+  cancelledAt      DateTime?
+
+  customer            User              @relation("OrdersAsCustomer", fields: [customerId], references: [id])
+  category             Category         @relation(fields: [categoryId], references: [id])
+  selectedApplication  OrderApplication? @relation("SelectedApplication", fields: [selectedApplicationId], references: [id])
+
+  applications OrderApplication[] @relation("OrderApplications")
+  photos       OrderPhoto[]
+  events       OrderEvent[]
+  reviews      Review[]
+
+  @@index([status])
+  @@index([categoryId])
+  @@index([customerId])
+  @@index([createdAt])
+  @@index([completedAt])
+  @@map("orders")
+}
+
+enum ApplicationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  WITHDRAWN
+}
+
+model OrderApplication {
+  id       String @id @default(uuid())
+  orderId  String
+  workerId String
+
+  proposedPriceMinor Int
+  proposedTime       DateTime
+  message            String?
+
+  status    ApplicationStatus @default(PENDING)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  order  Order @relation("OrderApplications", fields: [orderId], references: [id], onDelete: Cascade)
+  worker User  @relation(fields: [workerId], references: [id])
+
+  selectedForOrder Order? @relation("SelectedApplication")
+
+  // A worker can only have one *active* (PENDING) application per order.
+  // Prisma cannot express partial uniqueness (`WHERE status = 'PENDING'`),
+  // so that constraint is added as a raw-SQL partial unique index in the
+  // initial migration; this index only covers general lookups/joins.
+  @@index([orderId, workerId])
+  @@index([orderId])
+  @@index([workerId])
+  @@index([status])
+  @@map("order_applications")
+}
+
+// ---------------------------------------------------------------------------
+// Photos
+// ---------------------------------------------------------------------------
+
+enum PhotoType {
+  CUSTOMER_INPUT
+  WORKER_RESULT
+}
+
+enum PhotoStatus {
+  PENDING_UPLOAD
+  PRIVATE
+  PENDING_CUSTOMER_APPROVAL
+  PUBLIC_PORTFOLIO
+}
+
+model OrderPhoto {
+  id               String @id @default(uuid())
+  orderId          String
+  uploadedByUserId String
+
+  type        PhotoType
+  objectKey   String      @unique
+  contentType String
+  status      PhotoStatus @default(PENDING_UPLOAD)
+
+  createdAt  DateTime  @default(now())
+  approvedAt DateTime?
+
+  order          Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  uploadedByUser User  @relation(fields: [uploadedByUserId], references: [id])
+
+  @@index([orderId])
+  @@index([status])
+  @@map("order_photos")
+}
+
+// ---------------------------------------------------------------------------
+// Reviews
+// ---------------------------------------------------------------------------
+
+enum ReviewTargetRole {
+  CUSTOMER
+  WORKER
+}
+
+model Review {
+  id             String           @id @default(uuid())
+  orderId        String
+  authorUserId   String
+  targetUserId   String
+  targetRole     ReviewTargetRole
+  rating         Int
+  comment        String?
+  createdAt      DateTime         @default(now())
+
+  order  Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  author User  @relation("ReviewAuthor", fields: [authorUserId], references: [id])
+  target User  @relation("ReviewTarget", fields: [targetUserId], references: [id])
+
+  @@unique([orderId, authorUserId, targetRole])
+  @@index([targetUserId, targetRole, createdAt])
+  @@map("reviews")
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail (append-only)
+// ---------------------------------------------------------------------------
+
+enum OrderEventType {
+  ORDER_CREATED
+  APPLICATION_CREATED
+  APPLICATION_WITHDRAWN
+  APPLICATION_REJECTED
+  WORKER_SELECTED
+  ORDER_STARTED
+  WORK_SUBMITTED
+  PHOTO_UPLOADED
+  PORTFOLIO_PHOTOS_APPROVED
+  ORDER_COMPLETED
+  ORDER_CANCELLED
+  REVIEW_CREATED
+}
+
+model OrderEvent {
+  id           String         @id @default(uuid())
+  orderId      String
+  actorUserId  String?
+  type         OrderEventType
+  payload      Json           @default("{}")
+  createdAt    DateTime       @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorUserId], references: [id])
+
+  @@index([orderId])
+  @@map("order_events")
+}
+
+// ---------------------------------------------------------------------------
+// Transactional outbox
+// ---------------------------------------------------------------------------
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+model OutboxEvent {
+  id            String       @id @default(uuid())
+  type          String
+  aggregateType String
+  aggregateId   String
+  payload       Json         @default("{}")
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  nextAttemptAt DateTime?
+  createdAt     DateTime     @default(now())
+  processedAt   DateTime?
+
+  @@index([status, nextAttemptAt])
+  @@map("outbox_events")
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+model OtpCode {
+  id           String    @id @default(uuid())
+  phone        String
+  codeHash     String
+  requestIp    String?
+  expiresAt    DateTime
+  attemptsLeft Int       @default(5)
+  consumedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([phone, createdAt])
+  @@index([requestIp, createdAt])
+  @@map("otp_codes")
+}
+
+model RefreshSession {
+  id           String    @id @default(uuid())
+  userId       String
+  tokenHash    String    @unique
+  userAgent    String?
+  ip           String?
+  createdAt    DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+enum PushPlatform {
+  IOS
+  ANDROID
+}
+
+model PushDevice {
+  id         String       @id @default(uuid())
+  userId     String
+  token      String       @unique
+  platform   PushPlatform
+  createdAt  DateTime     @default(now())
+  lastSeenAt DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_devices")
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency
+// ---------------------------------------------------------------------------
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+model IdempotencyRecord {
+  id             String            @id @default(uuid())
+  userId         String
+  key            String
+  method         String
+  path           String
+  requestHash    String
+  status         IdempotencyStatus @default(IN_PROGRESS)
+  responseStatus Int?
+  responseBody   Json?
+  createdAt      DateTime          @default(now())
+  completedAt    DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@map("idempotency_records")
+}

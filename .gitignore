@@ -1,0 +1,31 @@
+# compiled output
+/dist
+/node_modules
+
+# logs
+*.log
+npm-debug.log*
+
+# env (real files with real secrets — the .example/.test templates ARE tracked)
+.env
+.env.local
+.env.development
+.env.production
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea
+
+# OS
+.DS_Store
+
+# tests
+/coverage
+/.nyc_output
+
+# prisma
+prisma/*.db
